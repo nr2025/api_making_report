@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Local data folders (do not publish personal data)
+вход/
+выход/
+
+# Optional local artifacts
+*.converted.docx
