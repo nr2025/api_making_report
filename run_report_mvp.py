@@ -183,22 +183,28 @@ def read_pdf(path: Path) -> tuple[str, list[str]]:
     return "", image_payloads
 
 
-def list_subject_folders(input_dir: Path) -> list[Path]:
+def read_current_subject_name(input_dir: Path) -> str:
     if not input_dir.exists():
         raise FileNotFoundError(f"Папка входа не найдена: {input_dir}")
-    subdirs = sorted(p for p in input_dir.iterdir() if p.is_dir())
-    if subdirs:
-        return subdirs
-    return [input_dir]
+    subject_path = input_dir / "субъект.txt"
+    if not subject_path.exists():
+        raise FileNotFoundError(f"Не найден файл с субъектом: {subject_path}")
+    subject_name = read_text_file(subject_path).strip()
+    if not subject_name:
+        raise ValueError(f"Файл субъекта пуст: {subject_path}")
+    return subject_name
 
 
-def read_subject_name(subject_dir: Path) -> str:
-    subject_path = subject_dir / "субъект.txt"
-    if subject_path.exists():
-        value = read_text_file(subject_path).strip()
-        if value:
-            return value
-    return subject_dir.name
+def resolve_subject_folder(input_dir: Path, subject_name: str) -> Path:
+    subject_dir = input_dir / subject_name
+    if subject_dir.exists() and subject_dir.is_dir():
+        return subject_dir
+
+    known_subject_dirs = sorted(p.name for p in input_dir.iterdir() if p.is_dir())
+    raise FileNotFoundError(
+        f"Не найдена папка субъекта '{subject_name}' в {input_dir}. "
+        f"Найденные подпапки: {known_subject_dirs}"
+    )
 
 
 def collect_documents(subject_dir: Path) -> PreparedInput:
@@ -286,7 +292,19 @@ def build_prompt_with_previous_steps(
     for step in previous_steps:
         parts.append("")
         parts.append(f"=== {step.prompt_file.stem} ===")
-        parts.append(step.output_json.read_text(encoding="utf-8"))
+        if step.parsed_json is not None:
+            parts.append(json.dumps(step.parsed_json, ensure_ascii=False, indent=2))
+            continue
+
+        if step.output_json.exists():
+            try:
+                disk_payload = json.loads(step.output_json.read_text(encoding="utf-8"))
+                parts.append(json.dumps(disk_payload, ensure_ascii=False, indent=2))
+                continue
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        parts.append(step.raw_response_text)
     return "\n".join(parts).strip()
 
 
@@ -548,8 +566,7 @@ def build_word_report(template_path: Path, output_docx: Path, prompt_results: li
     return output_docx
 
 
-def process_subject_folder(settings: Settings, subject_dir: Path) -> tuple[Path, Path]:
-    subject_name = read_subject_name(subject_dir)
+def process_subject_folder(settings: Settings, subject_dir: Path, subject_name: str) -> tuple[Path, Path]:
     prepared = collect_documents(subject_dir)
     if not prepared.text_documents and not prepared.images_base64:
         raise RuntimeError(f"Нет читаемых документов в папке: {subject_dir}")
@@ -593,11 +610,11 @@ def process_subject_folder(settings: Settings, subject_dir: Path) -> tuple[Path,
 
 def main() -> None:
     settings = load_settings(SETTINGS_PATH)
-    subject_dirs = list_subject_folders(settings.input_dir)
-    for subject_dir in subject_dirs:
-        intermediate_dir, report_docx_path = process_subject_folder(settings, subject_dir)
-        print(f"Промежуточные JSON: {intermediate_dir}")
-        print(f"Итоговый Word: {report_docx_path}")
+    subject_name = read_current_subject_name(settings.input_dir)
+    subject_dir = resolve_subject_folder(settings.input_dir, subject_name)
+    intermediate_dir, report_docx_path = process_subject_folder(settings, subject_dir, subject_name)
+    print(f"Промежуточные JSON: {intermediate_dir}")
+    print(f"Итоговый Word: {report_docx_path}")
 
 
 if __name__ == "__main__":
