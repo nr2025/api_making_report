@@ -1,2 +1,2 @@
 ﻿api_url: http://45.89.26.237:33523
-model: qwen2.5vl:72b-32k
+model: qwen2.5vl:32b-q8_h100
