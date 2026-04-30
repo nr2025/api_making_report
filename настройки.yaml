@@ -1,2 +1,2 @@
 ﻿api_url: http://45.89.26.237:33523
-model: qwen2.5vl:32b-q8_h100
+model: qwen3-vl:32b-thinking-q8_0_16k

@@ -382,10 +382,12 @@ def call_until_valid_json(
     settings: Settings,
     prompt: str,
     images_base64: list[str] | None = None,
-) -> tuple[dict, dict | list | None]:
+) -> tuple[dict, dict | list | None, str | None]:
     last_response: dict = {}
     parsed_json: dict | list | None = None
-    for _ in range(settings.max_json_retries):
+    last_raw_invalid_response = ""
+    retries = min(settings.max_json_retries, 3)
+    for _ in range(retries):
         last_response = call_ollama(
             api_url=settings.api_url,
             model=settings.model,
@@ -394,10 +396,17 @@ def call_until_valid_json(
             timeout_sec=settings.request_timeout_sec,
             images_base64=images_base64,
         )
-        parsed_json = extract_json_from_text(last_response.get("response", ""))
-        if parsed_json is not None:
-            break
-    return last_response, parsed_json
+        raw_text = last_response.get("response", "")
+        parsed_json = extract_json_from_text(raw_text)
+        if not isinstance(parsed_json, dict):
+            last_raw_invalid_response = raw_text
+            continue
+        if "данные" not in parsed_json:
+            last_raw_invalid_response = raw_text
+            parsed_json = None
+            continue
+        return last_response, parsed_json, None
+    return last_response, None, last_raw_invalid_response or last_response.get("response", "")
 
 
 def ensure_dict_payload(value: dict | list | None) -> dict:
@@ -415,6 +424,7 @@ def save_prompt_result_json(
     docs: PreparedInput,
     ollama_response: dict,
     parsed_json: dict | list | None,
+    format_error_raw_response: str | None = None,
 ) -> PromptRunResult:
     intermediate_dir.mkdir(parents=True, exist_ok=True)
     output_json = intermediate_dir / f"{prompt_file.stem}.json"
@@ -433,6 +443,18 @@ def save_prompt_result_json(
         "raw_response_text": ollama_response.get("response", ""),
     }
     output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if format_error_raw_response:
+        error_path = intermediate_dir / f"{prompt_file.stem}.ошибка_формата.txt"
+        error_body = (
+            "ошибка формата\n"
+            f"prompt: {prompt_file.name}\n"
+            "Требуется JSON-объект с ключом \"данные\".\n\n"
+            "Сырой ответ модели:\n"
+            f"{format_error_raw_response}"
+        )
+        error_path.write_text(error_body, encoding="utf-8")
+
     return PromptRunResult(
         prompt_file=prompt_file,
         output_json=output_json,
@@ -591,7 +613,7 @@ def process_subject_folder(settings: Settings, subject_dir: Path, subject_name: 
             )
             images = prepared.images_base64
 
-        response, parsed_json = call_until_valid_json(settings, full_prompt, images)
+        response, parsed_json, format_error_raw_response = call_until_valid_json(settings, full_prompt, images)
         prompt_runs.append(
             save_prompt_result_json(
                 intermediate_dir=intermediate_dir,
@@ -600,6 +622,7 @@ def process_subject_folder(settings: Settings, subject_dir: Path, subject_name: 
                 docs=prepared,
                 ollama_response=response,
                 parsed_json=parsed_json,
+                format_error_raw_response=format_error_raw_response,
             )
         )
 
