@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import re
 import urllib.error
@@ -22,6 +23,11 @@ try:
 except ImportError:
     docx = None
 
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
 
 ROOT_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = ROOT_DIR / "настройки.yaml"
@@ -32,12 +38,16 @@ TEMPLATE_PATH_DEFAULT = ROOT_DIR / "шаблон.docx"
 SUPPORTED_EXTENSIONS = {".docx", ".doc", ".pdf", ".jpg", ".jpeg", ".png"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 PDF_TEXT_MIN_CHARS_PER_PAGE = 50
+MAX_IMAGE_SIDE = 1536
 
 
 @dataclass
 class Settings:
     api_url: str
+    api_key: str
     model: str
+    enable_thinking: bool | None
+    repetition_penalty: float
     input_dir: Path
     prompts_dir: Path
     output_dir: Path
@@ -50,7 +60,7 @@ class Settings:
 @dataclass
 class PreparedInput:
     text_documents: list[dict[str, str]]
-    images_base64: list[str]
+    images_base64: list[tuple[str, str]]
     all_documents: list[str]
 
 
@@ -74,32 +84,49 @@ def parse_simple_yaml(path: Path) -> dict[str, str]:
     return settings
 
 
+def parse_optional_bool(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError(f"Некорректное булево значение: {value}")
+
+
 def load_settings(path: Path) -> Settings:
     if not path.exists():
         raise FileNotFoundError(f"Не найден файл настроек: {path}")
 
     raw = parse_simple_yaml(path)
     api_url = raw.get("api_url")
+    api_key = raw.get("api_key")
     model = raw.get("model")
-    if not api_url or not model:
-        raise ValueError("В настройках должны быть указаны api_url и model")
+    if not api_url or not api_key or not model:
+        raise ValueError("В настройках должны быть указаны api_url, api_key и model")
 
     input_dir = Path(raw.get("input_dir", str(INPUT_DIR_DEFAULT)))
     prompts_dir = Path(raw.get("prompts_dir", str(PROMPTS_DIR_DEFAULT)))
     output_dir = Path(raw.get("output_dir", str(OUTPUT_DIR_DEFAULT)))
     template_path = Path(raw.get("template_path", str(TEMPLATE_PATH_DEFAULT)))
+    enable_thinking = parse_optional_bool(raw.get("enable_thinking"))
+    repetition_penalty = float(raw.get("repetition_penalty", "1.2"))
     num_predict = int(raw.get("num_predict", "16384"))
     request_timeout_sec = int(raw.get("request_timeout_sec", "300"))
     max_json_retries = int(raw.get("max_json_retries", "3"))
 
     return Settings(
-        api_url=api_url.rstrip("/"),
+        api_url=api_url.replace(" ", "").rstrip("/"),
+        api_key=api_key,
         model=model,
+        enable_thinking=enable_thinking,
+        repetition_penalty=repetition_penalty,
         input_dir=input_dir,
         prompts_dir=prompts_dir,
         output_dir=output_dir,
         template_path=template_path,
-        num_predict=max(num_predict, 16384),
+        num_predict=num_predict,
         request_timeout_sec=request_timeout_sec,
         max_json_retries=max(1, max_json_retries),
     )
@@ -133,8 +160,52 @@ def is_supported_document_file(file_path: Path) -> bool:
     return file_path.suffix.lower() in SUPPORTED_EXTENSIONS
 
 
-def read_image_as_base64(path: Path) -> str:
-    return base64.b64encode(path.read_bytes()).decode("ascii")
+def image_mime_type(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext == ".png":
+        return "image/png"
+    if ext in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    return "application/octet-stream"
+
+
+def image_output_format(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext == ".png":
+        return "PNG"
+    return "JPEG"
+
+
+def resize_image_bytes(image_bytes: bytes, output_format: str) -> bytes:
+    if Image is None:
+        raise RuntimeError("Для обработки изображений требуется Pillow (PIL).")
+
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        width, height = img.size
+        long_side = max(width, height)
+        resized = img.copy()
+        if long_side > MAX_IMAGE_SIDE:
+            scale = MAX_IMAGE_SIDE / long_side
+            new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+            resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+            resized = img.resize(new_size, resampling)
+
+        output = io.BytesIO()
+        fmt = output_format.upper()
+        save_kwargs: dict = {}
+        if fmt == "JPEG":
+            if resized.mode not in {"RGB", "L"}:
+                resized = resized.convert("RGB")
+            save_kwargs = {"quality": 90, "optimize": True}
+        resized.save(output, format=fmt, **save_kwargs)
+        return output.getvalue()
+
+
+def read_image_as_base64(path: Path) -> tuple[str, str]:
+    mime = image_mime_type(path)
+    output_format = image_output_format(path)
+    resized_bytes = resize_image_bytes(path.read_bytes(), output_format)
+    return mime, base64.b64encode(resized_bytes).decode("ascii")
 
 
 def convert_doc_to_docx(path: Path) -> Path:
@@ -157,13 +228,13 @@ def convert_doc_to_docx(path: Path) -> Path:
     return output_path
 
 
-def read_pdf(path: Path) -> tuple[str, list[str]]:
+def read_pdf(path: Path) -> tuple[str, list[tuple[str, str]]]:
     if fitz is None:
         raise RuntimeError("Для обработки PDF требуется PyMuPDF (fitz).")
 
     text_parts: list[str] = []
     pages_text_len: list[int] = []
-    image_payloads: list[str] = []
+    image_payloads: list[tuple[str, str]] = []
     with fitz.open(path) as pdf:
         for page in pdf:
             page_text = page.get_text("text").strip()
@@ -178,7 +249,9 @@ def read_pdf(path: Path) -> tuple[str, list[str]]:
 
         for page in pdf:
             pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
-            image_payloads.append(base64.b64encode(pix.tobytes("png")).decode("ascii"))
+            png_bytes = pix.tobytes("png")
+            resized_png = resize_image_bytes(png_bytes, "PNG")
+            image_payloads.append(("image/png", base64.b64encode(resized_png).decode("ascii")))
 
     return "", image_payloads
 
@@ -308,35 +381,76 @@ def build_prompt_with_previous_steps(
     return "\n".join(parts).strip()
 
 
-def normalize_api_generate_url(api_url: str) -> str:
-    if re.search(r"/api/generate/?$", api_url):
+def normalize_chat_completions_url(api_url: str) -> str:
+    if re.search(r"/v1/chat/completions/?$", api_url):
         return api_url
-    return f"{api_url}/api/generate"
+    return f"{api_url}/v1/chat/completions"
+
+
+def build_chat_messages(prompt: str, images_base64: list[tuple[str, str]] | None = None) -> list[dict]:
+    if not images_base64:
+        return [{"role": "user", "content": prompt}]
+
+    content_items: list[dict] = [{"type": "text", "text": prompt}]
+    for mime, encoded_data in images_base64:
+        content_items.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{encoded_data}"},
+            }
+        )
+    return [{"role": "user", "content": content_items}]
+
+
+def extract_chat_content(response_payload: dict) -> str:
+    choices = response_payload.get("choices", [])
+    if not choices:
+        return ""
+    message = choices[0].get("message", {})
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(str(item.get("text", "")))
+        return "\n".join(part for part in text_parts if part)
+    return str(content)
 
 
 def call_ollama(
     api_url: str,
+    api_key: str,
     model: str,
+    enable_thinking: bool | None,
+    repetition_penalty: float,
     prompt: str,
     num_predict: int,
     timeout_sec: int,
-    images_base64: list[str] | None = None,
+    images_base64: list[tuple[str, str]] | None = None,
 ) -> dict:
-    url = normalize_api_generate_url(api_url)
+    url = normalize_chat_completions_url(api_url)
     payload = {
         "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"num_predict": num_predict},
+        "messages": build_chat_messages(prompt, images_base64),
+        "max_tokens": num_predict,
+        "temperature": 0.6,
+        "repetition_penalty": repetition_penalty,
     }
-    if images_base64:
-        payload["images"] = images_base64
+    if enable_thinking is not None:
+        payload["extra_body"] = {
+            "chat_template_kwargs": {"enable_thinking": enable_thinking}
+        }
 
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         url=url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
         method="POST",
     )
     try:
@@ -344,9 +458,9 @@ def call_ollama(
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         details = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Ollama HTTP {exc.code}: {details}") from exc
+        raise RuntimeError(f"vLLM HTTP {exc.code}: {details}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Не удалось подключиться к Ollama: {exc}") from exc
+        raise RuntimeError(f"Не удалось подключиться к vLLM API: {exc}") from exc
 
     return json.loads(body)
 
@@ -378,10 +492,18 @@ def extract_json_from_text(text: str) -> dict | list | None:
         return None
 
 
+def prepare_text_for_json_parsing(raw_text: str) -> str:
+    marker = "</think>"
+    marker_pos = raw_text.find(marker)
+    if marker_pos == -1:
+        return raw_text
+    return raw_text[marker_pos + len(marker) :].strip()
+
+
 def call_until_valid_json(
     settings: Settings,
     prompt: str,
-    images_base64: list[str] | None = None,
+    images_base64: list[tuple[str, str]] | None = None,
 ) -> tuple[dict, dict | list | None, str | None]:
     last_response: dict = {}
     parsed_json: dict | list | None = None
@@ -390,14 +512,18 @@ def call_until_valid_json(
     for _ in range(retries):
         last_response = call_ollama(
             api_url=settings.api_url,
+            api_key=settings.api_key,
             model=settings.model,
+            enable_thinking=settings.enable_thinking,
+            repetition_penalty=settings.repetition_penalty,
             prompt=prompt,
             num_predict=settings.num_predict,
             timeout_sec=settings.request_timeout_sec,
             images_base64=images_base64,
         )
-        raw_text = last_response.get("response", "")
-        parsed_json = extract_json_from_text(raw_text)
+        raw_text = extract_chat_content(last_response)
+        json_candidate_text = prepare_text_for_json_parsing(raw_text)
+        parsed_json = extract_json_from_text(json_candidate_text)
         if not isinstance(parsed_json, dict):
             last_raw_invalid_response = raw_text
             continue
@@ -406,7 +532,7 @@ def call_until_valid_json(
             parsed_json = None
             continue
         return last_response, parsed_json, None
-    return last_response, None, last_raw_invalid_response or last_response.get("response", "")
+    return last_response, None, last_raw_invalid_response or extract_chat_content(last_response)
 
 
 def ensure_dict_payload(value: dict | list | None) -> dict:
@@ -428,6 +554,7 @@ def save_prompt_result_json(
 ) -> PromptRunResult:
     intermediate_dir.mkdir(parents=True, exist_ok=True)
     output_json = intermediate_dir / f"{prompt_file.stem}.json"
+    raw_response_text = extract_chat_content(ollama_response)
     payload = {
         "meta": {
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -440,7 +567,7 @@ def save_prompt_result_json(
         },
         "данные": ensure_dict_payload(parsed_json).get("данные", []),
         "parsed_json_response": parsed_json,
-        "raw_response_text": ollama_response.get("response", ""),
+        "raw_response_text": raw_response_text,
     }
     output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -459,7 +586,7 @@ def save_prompt_result_json(
         prompt_file=prompt_file,
         output_json=output_json,
         parsed_json=parsed_json,
-        raw_response_text=ollama_response.get("response", ""),
+        raw_response_text=raw_response_text,
     )
 
 

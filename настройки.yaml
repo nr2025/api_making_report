@@ -1,2 +1,7 @@
-﻿api_url: http://45.89.26.237:33523
-model: qwen3-vl:32b-thinking-q8_0_16k
+﻿api_url: http://111.88.125.234:8000/v1/chat/completions
+api_key: vllm_Q7xN2mP8Kc4Rv9YaFh3UzL6BtSDsE5Jn
+model: Qwen/Qwen3.6-27B-FP8
+request_timeout_sec: 1200
+max_tokens: 16384
+enable_thinking: false
+repetition_penalty: 1.2
