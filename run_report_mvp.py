@@ -711,7 +711,17 @@ def build_word_report(template_path: Path, output_docx: Path, prompt_results: li
         replace_placeholder_in_paragraphs(document, placeholder, string_lines)
 
     output_docx.parent.mkdir(parents=True, exist_ok=True)
-    document.save(str(output_docx))
+    try:
+        document.save(str(output_docx))
+    except PermissionError as exc:
+        lock_file = output_docx.parent / f"~${output_docx.name}"
+        raise RuntimeError(
+            "Не удалось сохранить итоговый Word-файл. "
+            f"Путь: {output_docx}. "
+            "Скорее всего файл открыт в Word или заблокирован другим процессом. "
+            "Закройте документ, удалите временный lock-файл (если есть) "
+            f"{lock_file} и запустите скрипт снова."
+        ) from exc
     return output_docx
 
 
