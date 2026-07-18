@@ -335,7 +335,9 @@ def list_prompt_files(prompts_dir: Path) -> list[Path]:
 def subject_prefix(subject_name: str) -> str:
     return (
         f"Субъект исследования: {subject_name}.\n"
-        "Если в задании не указано иное, данные извлекаются в отношении Субъекта."
+        "Если в задании не указано иное, данные извлекаются в отношении Субъекта.\n"
+        "Рассуждай и отвечай только на русском языке. "
+        'Ключ в JSON — строго "данные" русскими буквами.'
     )
 
 
@@ -500,6 +502,79 @@ def prepare_text_for_json_parsing(raw_text: str) -> str:
     return raw_text[marker_pos + len(marker) :].strip()
 
 
+def extract_json_object_fragments(text: str) -> list[str]:
+    fragments: list[str] = []
+    stack: list[int] = []
+    in_string = False
+    is_escaped = False
+
+    for index, char in enumerate(text):
+        if in_string:
+            if is_escaped:
+                is_escaped = False
+            elif char == "\\":
+                is_escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+
+        if char == "{":
+            stack.append(index)
+            continue
+        if char == "}" and stack:
+            start = stack.pop()
+            fragments.append(text[start : index + 1])
+    return fragments
+
+
+def normalize_payload_with_data_array(payload: dict) -> dict | None:
+    for key in ("данные", "data", "result", "результат"):
+        value = payload.get(key)
+        if not isinstance(value, list):
+            continue
+        if key == "данные":
+            return payload
+        normalized_payload = dict(payload)
+        normalized_payload["данные"] = value
+        return normalized_payload
+    return None
+
+
+def salvage_json_from_raw_text(raw_text: str) -> dict | None:
+    for fragment in reversed(extract_json_object_fragments(raw_text)):
+        try:
+            payload = json.loads(fragment)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        normalized_payload = normalize_payload_with_data_array(payload)
+        if normalized_payload is not None:
+            return normalized_payload
+    return None
+
+
+def has_highly_repetitive_substring(
+    text: str,
+    substring_len: int = 10,
+    max_allowed_repeats: int = 30,
+) -> bool:
+    if len(text) < substring_len:
+        return False
+    counts: dict[str, int] = {}
+    for index in range(0, len(text) - substring_len + 1):
+        chunk = text[index : index + substring_len]
+        next_count = counts.get(chunk, 0) + 1
+        if next_count > max_allowed_repeats:
+            return True
+        counts[chunk] = next_count
+    return False
+
+
 def call_until_valid_json(
     settings: Settings,
     prompt: str,
@@ -522,8 +597,20 @@ def call_until_valid_json(
             images_base64=images_base64,
         )
         raw_text = extract_chat_content(last_response)
+        if has_highly_repetitive_substring(raw_text):
+            last_raw_invalid_response = raw_text
+            continue
         json_candidate_text = prepare_text_for_json_parsing(raw_text)
         parsed_json = extract_json_from_text(json_candidate_text)
+        if isinstance(parsed_json, dict):
+            normalized_payload = normalize_payload_with_data_array(parsed_json)
+            if normalized_payload is not None:
+                return last_response, normalized_payload, None
+
+        salvaged_json = salvage_json_from_raw_text(raw_text)
+        if salvaged_json is not None:
+            return last_response, salvaged_json, None
+
         if not isinstance(parsed_json, dict):
             last_raw_invalid_response = raw_text
             continue
@@ -531,7 +618,6 @@ def call_until_valid_json(
             last_raw_invalid_response = raw_text
             parsed_json = None
             continue
-        return last_response, parsed_json, None
     return last_response, None, last_raw_invalid_response or extract_chat_content(last_response)
 
 
@@ -555,6 +641,7 @@ def save_prompt_result_json(
     intermediate_dir.mkdir(parents=True, exist_ok=True)
     output_json = intermediate_dir / f"{prompt_file.stem}.json"
     raw_response_text = extract_chat_content(ollama_response)
+    has_format_error = format_error_raw_response is not None and parsed_json is None
     payload = {
         "meta": {
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -564,6 +651,7 @@ def save_prompt_result_json(
             "text_documents_count": len(docs.text_documents),
             "images_count": len(docs.images_base64),
             "documents": docs.all_documents,
+            "format_error": has_format_error,
         },
         "данные": ensure_dict_payload(parsed_json).get("данные", []),
         "parsed_json_response": parsed_json,
@@ -690,8 +778,17 @@ def build_word_report(template_path: Path, output_docx: Path, prompt_results: li
 
     for tag, payload in payload_by_tag.items():
         placeholder = f"{{{{{tag}}}}}"
+        meta = payload.get("meta", {})
+        has_format_error = bool(meta.get("format_error"))
         raw_values = payload.get("данные", [])
         values = raw_values if isinstance(raw_values, list) else []
+        if has_format_error:
+            replace_placeholder_in_paragraphs(
+                document,
+                placeholder,
+                ["⚠ Ошибка обработки раздела, требуется ручная проверка"],
+            )
+            continue
         is_object_values = values and all(isinstance(item, dict) for item in values)
 
         if is_object_values:
