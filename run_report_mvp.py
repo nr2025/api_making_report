@@ -467,7 +467,32 @@ def call_ollama(
     return json.loads(body)
 
 
+THINK_END_MARKER = "</think>"
+MARKDOWN_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
+# Одна и та же подстрока подряд 30+ раз (не суммарные вхождения по тексту).
+CONSECUTIVE_REPEAT_RE = re.compile(r"(.{1,64})\1{29,}", re.DOTALL)
+
+
+def split_thinking_and_answer(raw_text: str) -> tuple[str, str]:
+    """Шаг 1: отрезать всё до </think> включительно. Возвращает (рассуждения, ответ)."""
+    marker_pos = raw_text.find(THINK_END_MARKER)
+    if marker_pos == -1:
+        return "", raw_text
+    thinking = raw_text[:marker_pos]
+    answer = raw_text[marker_pos + len(THINK_END_MARKER) :].strip()
+    return thinking, answer
+
+
+def strip_markdown_fences(text: str) -> str:
+    """Шаг 2: снять markdown-обёртки; при нескольких блоках взять последний."""
+    matches = MARKDOWN_FENCE_RE.findall(text)
+    if not matches:
+        return text
+    return matches[-1].strip()
+
+
 def extract_json_from_text(text: str) -> dict | list | None:
+    """Шаг 3: распарсить JSON целиком, иначе фрагмент от первой { до последней }."""
     text = text.strip()
     if not text:
         return None
@@ -476,63 +501,19 @@ def extract_json_from_text(text: str) -> dict | list | None:
     except json.JSONDecodeError:
         pass
 
-    first_obj = text.find("{")
-    first_arr = text.find("[")
-    starts = [i for i in (first_obj, first_arr) if i != -1]
-    if not starts:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
         return None
-    start = min(starts)
-    last_obj = text.rfind("}")
-    last_arr = text.rfind("]")
-    end = max(last_obj, last_arr)
-    if end < start:
-        return None
-
     try:
         return json.loads(text[start : end + 1])
     except json.JSONDecodeError:
         return None
 
 
-def prepare_text_for_json_parsing(raw_text: str) -> str:
-    marker = "</think>"
-    marker_pos = raw_text.find(marker)
-    if marker_pos == -1:
-        return raw_text
-    return raw_text[marker_pos + len(marker) :].strip()
-
-
-def extract_json_object_fragments(text: str) -> list[str]:
-    fragments: list[str] = []
-    stack: list[int] = []
-    in_string = False
-    is_escaped = False
-
-    for index, char in enumerate(text):
-        if in_string:
-            if is_escaped:
-                is_escaped = False
-            elif char == "\\":
-                is_escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-
-        if char == '"':
-            in_string = True
-            continue
-
-        if char == "{":
-            stack.append(index)
-            continue
-        if char == "}" and stack:
-            start = stack.pop()
-            fragments.append(text[start : index + 1])
-    return fragments
-
-
 def normalize_payload_with_data_array(payload: dict) -> dict | None:
-    for key in ("данные", "data", "result", "результат"):
+    """Шаг 4: принять только объект с ключом данные/data-массивом."""
+    for key in ("данные", "data"):
         value = payload.get(key)
         if not isinstance(value, list):
             continue
@@ -544,35 +525,28 @@ def normalize_payload_with_data_array(payload: dict) -> dict | None:
     return None
 
 
-def salvage_json_from_raw_text(raw_text: str) -> dict | None:
-    for fragment in reversed(extract_json_object_fragments(raw_text)):
-        try:
-            payload = json.loads(fragment)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        normalized_payload = normalize_payload_with_data_array(payload)
-        if normalized_payload is not None:
-            return normalized_payload
-    return None
+def try_parse_valid_payload(text: str) -> dict | None:
+    """Шаги 2–4: markdown → JSON → проверка ключа данные/data."""
+    if not text or not text.strip():
+        return None
+    candidate = strip_markdown_fences(text)
+    parsed = extract_json_from_text(candidate)
+    if not isinstance(parsed, dict):
+        return None
+    return normalize_payload_with_data_array(parsed)
 
 
-def has_highly_repetitive_substring(
+def has_consecutive_repeated_substring(
     text: str,
-    substring_len: int = 10,
     max_allowed_repeats: int = 30,
 ) -> bool:
-    if len(text) < substring_len:
+    """Детектор дегенерации: только подряд идущие повторы одной подстроки."""
+    if not text or max_allowed_repeats < 2:
         return False
-    counts: dict[str, int] = {}
-    for index in range(0, len(text) - substring_len + 1):
-        chunk = text[index : index + substring_len]
-        next_count = counts.get(chunk, 0) + 1
-        if next_count > max_allowed_repeats:
-            return True
-        counts[chunk] = next_count
-    return False
+    if max_allowed_repeats == 30:
+        return CONSECUTIVE_REPEAT_RE.search(text) is not None
+    pattern = re.compile(rf"(.{{1,64}})\1{{{max_allowed_repeats - 1},}}", re.DOTALL)
+    return pattern.search(text) is not None
 
 
 def call_until_valid_json(
@@ -581,7 +555,6 @@ def call_until_valid_json(
     images_base64: list[tuple[str, str]] | None = None,
 ) -> tuple[dict, dict | list | None, str | None]:
     last_response: dict = {}
-    parsed_json: dict | list | None = None
     last_raw_invalid_response = ""
     retries = min(settings.max_json_retries, 3)
     for _ in range(retries):
@@ -597,27 +570,25 @@ def call_until_valid_json(
             images_base64=images_base64,
         )
         raw_text = extract_chat_content(last_response)
-        if has_highly_repetitive_substring(raw_text):
-            last_raw_invalid_response = raw_text
-            continue
-        json_candidate_text = prepare_text_for_json_parsing(raw_text)
-        parsed_json = extract_json_from_text(json_candidate_text)
-        if isinstance(parsed_json, dict):
-            normalized_payload = normalize_payload_with_data_array(parsed_json)
-            if normalized_payload is not None:
-                return last_response, normalized_payload, None
+        thinking_text, answer_text = split_thinking_and_answer(raw_text)
 
-        salvaged_json = salvage_json_from_raw_text(raw_text)
-        if salvaged_json is not None:
-            return last_response, salvaged_json, None
+        # Шаги 1–4 по ответу после </think> (или по всему тексту, если тега нет).
+        payload = try_parse_valid_payload(answer_text)
+        if payload is not None:
+            return last_response, payload, None
 
-        if not isinstance(parsed_json, dict):
-            last_raw_invalid_response = raw_text
-            continue
-        if "данные" not in parsed_json:
-            last_raw_invalid_response = raw_text
-            parsed_json = None
-            continue
+        # Шаг 6: спасение из рассуждений (те же шаги 2–4), до перезапроса.
+        # Детектор повторов к рассуждениям не применяется.
+        salvaged = try_parse_valid_payload(thinking_text)
+        if salvaged is not None:
+            return last_response, salvaged, None
+
+        # Шаг 5: дегенерация только по остатку после обрезки и только если JSON не принят.
+        # Считаем исключительно подряд идущие повторы; к рассуждениям не применяем.
+        # Затем перезапрос (и при дегенерации, и при обычной ошибке формата).
+        last_raw_invalid_response = raw_text
+        has_consecutive_repeated_substring(answer_text)
+        continue
     return last_response, None, last_raw_invalid_response or extract_chat_content(last_response)
 
 
