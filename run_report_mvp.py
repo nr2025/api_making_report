@@ -4,11 +4,12 @@ import base64
 import io
 import json
 import re
+import sys
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -35,11 +36,36 @@ INPUT_DIR_DEFAULT = ROOT_DIR / "вход"
 PROMPTS_DIR_DEFAULT = ROOT_DIR / "промпты"
 OUTPUT_DIR_DEFAULT = ROOT_DIR / "выход"
 TEMPLATE_PATH_DEFAULT = ROOT_DIR / "шаблон.docx"
-SUPPORTED_EXTENSIONS = {".docx", ".doc", ".pdf", ".jpg", ".jpeg", ".png"}
+SUPPORTED_EXTENSIONS = {".docx", ".doc", ".pdf", ".jpg", ".jpeg", ".png", ".txt"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 PDF_TEXT_MIN_CHARS_PER_PAGE = 50
 MAX_IMAGE_SIDE = 1536
 
+
+def проверить_окружение() -> None:
+    """Жёсткая проверка обязательных библиотек до обработки документов."""
+    checks: list[tuple[str, str, str]] = [
+        ("fitz", "PyMuPDF", "pymupdf"),
+        ("PIL", "Pillow", "Pillow"),
+        ("docx", "python-docx", "python-docx"),
+        ("yaml", "PyYAML", "PyYAML"),
+        ("win32com.client", "pywin32", "pywin32"),
+    ]
+    missing_names: list[str] = []
+    missing_packages: list[str] = []
+    for module_name, display_name, pip_name in checks:
+        try:
+            __import__(module_name)
+        except ImportError:
+            missing_names.append(display_name)
+            missing_packages.append(pip_name)
+    if missing_names:
+        packages = " ".join(missing_packages)
+        raise RuntimeError(
+            f"Отсутствуют библиотеки: {', '.join(missing_names)}. "
+            f"Python: {sys.executable}. "
+            f"Установите: {sys.executable} -m pip install {packages}"
+        )
 
 @dataclass
 class Settings:
@@ -62,6 +88,7 @@ class PreparedInput:
     text_documents: list[dict[str, str]]
     images_base64: list[tuple[str, str]]
     all_documents: list[str]
+    unreadable_documents: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -282,8 +309,9 @@ def resolve_subject_folder(input_dir: Path, subject_name: str) -> Path:
 
 def collect_documents(subject_dir: Path) -> PreparedInput:
     text_docs: list[dict[str, str]] = []
-    images_base64: list[str] = []
-    all_docs: list[str] = []
+    images_base64: list[tuple[str, str]] = []
+    readable_docs: list[str] = []
+    unreadable_docs: list[str] = []
 
     for file_path in sorted(p for p in subject_dir.rglob("*") if p.is_file()):
         if file_path.name.lower() == "субъект.txt":
@@ -292,28 +320,52 @@ def collect_documents(subject_dir: Path) -> PreparedInput:
             continue
 
         rel_path = str(file_path.relative_to(subject_dir))
-        all_docs.append(rel_path)
         ext = file_path.suffix.lower()
+        got_text = False
+        got_images = False
         try:
-            if ext == ".docx":
+            if ext == ".txt":
+                content = read_text_file(file_path).strip()
+                if content:
+                    text_docs.append({"path": rel_path, "content": content})
+                    got_text = True
+            elif ext == ".docx":
                 content = read_docx_text(file_path).strip()
                 if content:
                     text_docs.append({"path": rel_path, "content": content})
+                    got_text = True
             elif ext == ".doc":
                 converted = convert_doc_to_docx(file_path)
                 content = read_docx_text(converted).strip()
                 if content:
                     text_docs.append({"path": rel_path, "content": content})
+                    got_text = True
             elif ext == ".pdf":
                 pdf_text, pdf_images = read_pdf(file_path)
                 if pdf_text:
                     text_docs.append({"path": rel_path, "content": pdf_text})
-                images_base64.extend(pdf_images)
+                    got_text = True
+                if pdf_images:
+                    images_base64.extend(pdf_images)
+                    got_images = True
             elif ext in IMAGE_EXTENSIONS:
                 images_base64.append(read_image_as_base64(file_path))
-        except Exception as exc:  # noqa: BLE001
-            text_docs.append({"path": rel_path, "content": f"[Ошибка чтения файла: {exc}]"})
-    return PreparedInput(text_documents=text_docs, images_base64=images_base64, all_documents=all_docs)
+                got_images = True
+        except Exception:  # noqa: BLE001 — файл помечается как нечитаемый
+            got_text = False
+            got_images = False
+
+        if got_text or got_images:
+            readable_docs.append(rel_path)
+        else:
+            unreadable_docs.append(rel_path)
+
+    return PreparedInput(
+        text_documents=text_docs,
+        images_base64=images_base64,
+        all_documents=readable_docs,
+        unreadable_documents=unreadable_docs,
+    )
 
 
 def prompt_sort_key(path: Path) -> tuple[int, str]:
@@ -622,6 +674,7 @@ def save_prompt_result_json(
             "text_documents_count": len(docs.text_documents),
             "images_count": len(docs.images_base64),
             "documents": docs.all_documents,
+            "unreadable_documents": list(docs.unreadable_documents),
             "format_error": has_format_error,
         },
         "данные": ensure_dict_payload(parsed_json).get("данные", []),
@@ -695,12 +748,52 @@ def stringify_cell_value(value) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def format_field_name(key: str) -> str:
+    name = str(key).replace("_", " ").strip()
+    if not name:
+        return name
+    return name[0].upper() + name[1:]
+
+
+def object_to_text_lines(item: dict) -> str:
+    parts: list[str] = []
+    for key, value in item.items():
+        text = stringify_cell_value(value).strip()
+        if not text:
+            continue
+        parts.append(f"{format_field_name(key)}: {text}")
+    return "\n".join(parts)
+
+
 def find_placeholder_row(table, placeholder: str):
     for row in table.rows:
         for cell in row.cells:
             if placeholder in cell.text:
                 return row
     return None
+
+
+def is_data_table_for(table, placeholder: str) -> bool:
+    """Таблица данных: метка во 2-й строке, над ней строка заголовков из непустых ячеек."""
+    placeholder_row_index = None
+    for index, row in enumerate(table.rows):
+        if any(placeholder in cell.text for cell in row.cells):
+            placeholder_row_index = index
+            break
+    if placeholder_row_index is None:
+        return False
+    # Первая строка таблицы должна быть непосредственно над строкой с меткой.
+    if placeholder_row_index != 1:
+        return False
+
+    header = table.rows[0]
+    if any(placeholder in cell.text for cell in header.cells):
+        return False
+    if not header.cells:
+        return False
+    if not all(cell.text.strip() for cell in header.cells):
+        return False
+    return True
 
 
 def fill_table_for_objects(table, placeholder: str, values: list[dict]) -> bool:
@@ -712,10 +805,19 @@ def fill_table_for_objects(table, placeholder: str, values: list[dict]) -> bool:
     rows_to_add = values if values else [{"данные": "данные не обнаружены"}]
     for item in rows_to_add:
         new_row = table.add_row()
-        for idx, (_, value) in enumerate(item.items()):
-            if idx >= len(new_row.cells):
-                break
-            set_cell_text_with_breaks(new_row.cells[idx], stringify_cell_value(value))
+        fields = list(item.items())
+        n_cols = len(new_row.cells)
+        if n_cols == 0:
+            continue
+
+        for idx in range(min(len(fields), n_cols)):
+            set_cell_text_with_breaks(new_row.cells[idx], stringify_cell_value(fields[idx][1]))
+
+        if len(fields) > n_cols:
+            last_parts = [stringify_cell_value(fields[n_cols - 1][1])]
+            for key, value in fields[n_cols:]:
+                last_parts.append(f"{format_field_name(key)}: {stringify_cell_value(value)}")
+            set_cell_text_with_breaks(new_row.cells[n_cols - 1], "\n".join(last_parts))
     return True
 
 
@@ -733,13 +835,66 @@ def replace_placeholder_in_paragraphs(document, placeholder: str, lines: list[st
     return changed
 
 
-def build_word_report(template_path: Path, output_docx: Path, prompt_results: list[PromptRunResult]) -> Path:
+def replace_text_in_paragraph(paragraph, old: str, new: str) -> None:
+    if old not in paragraph.text:
+        return
+    for run in paragraph.runs:
+        if old in run.text:
+            run.text = run.text.replace(old, new)
+    # Если «g.» разбит по нескольким run — пересобираем текст абзаца целиком.
+    if old in paragraph.text:
+        set_paragraph_text_with_breaks(paragraph, paragraph.text.replace(old, new))
+
+
+def apply_document_text_fixes(document) -> None:
+    """Автозамены в собранном Word-документе."""
+    for paragraph in document.paragraphs:
+        replace_text_in_paragraph(paragraph, "g.", "г.")
+    for table in document.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    replace_text_in_paragraph(paragraph, "g.", "г.")
+
+
+def insert_paragraph_after(paragraph, text: str, bold: bool = False):
+    new_p = docx.oxml.OxmlElement("w:p")
+    paragraph._p.addnext(new_p)  # noqa: SLF001
+    new_para = docx.text.paragraph.Paragraph(new_p, paragraph._parent)
+    run = new_para.add_run(text)
+    run.bold = bold
+    return new_para
+
+
+def insert_unreadable_warning(document, unreadable_documents: list[str]) -> None:
+    if not unreadable_documents:
+        return
+    names = ", ".join(unreadable_documents)
+    warning = (
+        "⚠ ВНИМАНИЕ: следующие документы не были обработаны: "
+        f"{names}. Отчёт составлен без их учёта."
+    )
+    if not document.paragraphs:
+        paragraph = document.add_paragraph("")
+        run = paragraph.add_run(warning)
+        run.bold = True
+        return
+    insert_paragraph_after(document.paragraphs[0], warning, bold=True)
+
+
+def build_word_report(
+    template_path: Path,
+    output_docx: Path,
+    prompt_results: list[PromptRunResult],
+    unreadable_documents: list[str] | None = None,
+) -> Path:
     if docx is None:
         raise RuntimeError("Для сборки Word нужен пакет python-docx.")
     if not template_path.exists():
         raise FileNotFoundError(f"Не найден шаблон Word: {template_path}")
 
     document = docx.Document(str(template_path))
+    insert_unreadable_warning(document, unreadable_documents or [])
     payload_by_tag: dict[str, dict] = {}
     for step in prompt_results:
         try:
@@ -763,20 +918,25 @@ def build_word_report(template_path: Path, output_docx: Path, prompt_results: li
         is_object_values = values and all(isinstance(item, dict) for item in values)
 
         if is_object_values:
-            table_handled = False
+            data_table = None
             for table in document.tables:
-                if fill_table_for_objects(table, placeholder, values):
-                    table_handled = True
+                if is_data_table_for(table, placeholder):
+                    data_table = table
                     break
-            if not table_handled:
-                fallback_lines = [json.dumps(values, ensure_ascii=False, indent=2)]
-                replace_placeholder_in_paragraphs(document, placeholder, fallback_lines)
+            if data_table is not None:
+                fill_table_for_objects(data_table, placeholder, values)
+            else:
+                text_blocks = [object_to_text_lines(item) for item in values]
+                text_blocks = [block for block in text_blocks if block] or ["данные не обнаружены"]
+                replace_placeholder_in_paragraphs(document, placeholder, text_blocks)
             continue
 
         string_lines = [str(item) for item in values if isinstance(item, str)]
         if not string_lines:
             string_lines = ["данные не обнаружены"]
         replace_placeholder_in_paragraphs(document, placeholder, string_lines)
+
+    apply_document_text_fixes(document)
 
     output_docx.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -793,17 +953,26 @@ def build_word_report(template_path: Path, output_docx: Path, prompt_results: li
     return output_docx
 
 
-def process_subject_folder(settings: Settings, subject_dir: Path, subject_name: str) -> tuple[Path, Path]:
+def process_subject_folder(
+    settings: Settings,
+    subject_dir: Path,
+    subject_name: str,
+    progress_callback=None,
+) -> tuple[Path, Path, list[str]]:
+    проверить_окружение()
     prepared = collect_documents(subject_dir)
     if not prepared.text_documents and not prepared.images_base64:
-        raise RuntimeError(f"Нет читаемых документов в папке: {subject_dir}")
+        raise RuntimeError("Ни один документ не удалось прочитать")
 
     prompt_files = list_prompt_files(settings.prompts_dir)
     output_subject_dir = settings.output_dir / subject_dir.name
     intermediate_dir = output_subject_dir / "промежуточные"
     prompt_runs: list[PromptRunResult] = []
+    total_steps = len(prompt_files)
 
     for index, prompt_file in enumerate(prompt_files):
+        if progress_callback is not None:
+            progress_callback(index + 1, total_steps)
         prompt_text = read_text_file(prompt_file)
         is_last = index == len(prompt_files) - 1
         if is_last:
@@ -832,15 +1001,22 @@ def process_subject_folder(settings: Settings, subject_dir: Path, subject_name: 
         )
 
     report_docx_path = output_subject_dir / f"{subject_dir.name}.docx"
-    build_word_report(settings.template_path, report_docx_path, prompt_runs)
-    return intermediate_dir, report_docx_path
+    build_word_report(
+        settings.template_path,
+        report_docx_path,
+        prompt_runs,
+        unreadable_documents=prepared.unreadable_documents,
+    )
+    return intermediate_dir, report_docx_path, list(prepared.unreadable_documents)
 
 
 def main() -> None:
     settings = load_settings(SETTINGS_PATH)
     subject_name = read_current_subject_name(settings.input_dir)
     subject_dir = resolve_subject_folder(settings.input_dir, subject_name)
-    intermediate_dir, report_docx_path = process_subject_folder(settings, subject_dir, subject_name)
+    intermediate_dir, report_docx_path, _unreadable = process_subject_folder(
+        settings, subject_dir, subject_name
+    )
     print(f"Промежуточные JSON: {intermediate_dir}")
     print(f"Итоговый Word: {report_docx_path}")
 

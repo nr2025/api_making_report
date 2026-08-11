@@ -1,0 +1,7 @@
+streamlit
+pymupdf
+pillow
+python-docx
+pyyaml
+requests
+pywin32
