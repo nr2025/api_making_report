@@ -40,6 +40,12 @@ SUPPORTED_EXTENSIONS = {".docx", ".doc", ".pdf", ".jpg", ".jpeg", ".png", ".txt"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 PDF_TEXT_MIN_CHARS_PER_PAGE = 50
 MAX_IMAGE_SIDE = 1536
+ALLOWED_REASONING_EFFORTS = ("low", "medium", "xhigh")
+DEFAULT_REASONING_EFFORT = "medium"
+REASONING_MARKER_RE = re.compile(
+    r"^REASONING:\s*(low|medium|xhigh)\s*$",
+    re.IGNORECASE,
+)
 
 
 def проверить_окружение() -> None:
@@ -81,6 +87,7 @@ class Settings:
     num_predict: int
     request_timeout_sec: int
     max_json_retries: int
+    reasoning_effort: str
 
 
 @dataclass
@@ -122,6 +129,29 @@ def parse_optional_bool(value: str | None) -> bool | None:
     raise ValueError(f"Некорректное булево значение: {value}")
 
 
+def parse_reasoning_effort(value: str | None, default: str = DEFAULT_REASONING_EFFORT) -> str:
+    if value is None or not str(value).strip():
+        return default
+    normalized = str(value).strip().lower()
+    if normalized not in ALLOWED_REASONING_EFFORTS:
+        allowed = ", ".join(ALLOWED_REASONING_EFFORTS)
+        raise ValueError(f"Некорректное reasoning_effort: {value}. Допустимо: {allowed}")
+    return normalized
+
+
+def extract_prompt_reasoning_effort(prompt_text: str, default: str) -> tuple[str, str]:
+    """Если первая строка — REASONING: low|medium|xhigh, вернуть её значение и текст без маркера."""
+    if not prompt_text:
+        return default, prompt_text
+    first_line, sep, rest = prompt_text.partition("\n")
+    match = REASONING_MARKER_RE.match(first_line.strip())
+    if not match:
+        return default, prompt_text
+    effort = parse_reasoning_effort(match.group(1), default)
+    remainder = rest if sep else ""
+    return effort, remainder.lstrip("\r\n")
+
+
 def load_settings(path: Path) -> Settings:
     if not path.exists():
         raise FileNotFoundError(f"Не найден файл настроек: {path}")
@@ -142,6 +172,7 @@ def load_settings(path: Path) -> Settings:
     num_predict = int(raw.get("num_predict", "16384"))
     request_timeout_sec = int(raw.get("request_timeout_sec", "300"))
     max_json_retries = int(raw.get("max_json_retries", "3"))
+    reasoning_effort = parse_reasoning_effort(raw.get("reasoning_effort"), DEFAULT_REASONING_EFFORT)
 
     return Settings(
         api_url=api_url.replace(" ", "").rstrip("/"),
@@ -156,6 +187,7 @@ def load_settings(path: Path) -> Settings:
         num_predict=num_predict,
         request_timeout_sec=request_timeout_sec,
         max_json_retries=max(1, max_json_retries),
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -456,21 +488,61 @@ def build_chat_messages(prompt: str, images_base64: list[tuple[str, str]] | None
     return [{"role": "user", "content": content_items}]
 
 
+def _message_text_field(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(part for part in parts if part)
+    return str(value)
+
+
 def extract_chat_content(response_payload: dict) -> str:
     choices = response_payload.get("choices", [])
     if not choices:
         return ""
     message = choices[0].get("message", {})
-    content = message.get("content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text_parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text_parts.append(str(item.get("text", "")))
-        return "\n".join(part for part in text_parts if part)
-    return str(content)
+    return _message_text_field(message.get("content"))
+
+
+def extract_reasoning_text(response_payload: dict) -> str:
+    """Текст рассуждений из ответа API. На разбор JSON и сборку Word не влияет."""
+    if not isinstance(response_payload, dict):
+        return ""
+    choices = response_payload.get("choices") or []
+    message = choices[0].get("message", {}) if choices else {}
+    if not isinstance(message, dict):
+        message = {}
+
+    candidates: list[str] = []
+    for source in (message, choices[0] if choices else {}, response_payload):
+        if not isinstance(source, dict):
+            continue
+        for key in ("reasoning", "reasoning_content", "reasoning_text", "thinking"):
+            text = _message_text_field(source.get(key)).strip()
+            if text:
+                candidates.append(text)
+
+    content = _message_text_field(message.get("content"))
+    thinking, _answer = split_thinking_and_answer(content)
+    thinking = thinking.strip()
+    if thinking:
+        candidates.append(thinking)
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for text in candidates:
+        if text not in seen:
+            seen.add(text)
+            unique.append(text)
+    return "\n\n".join(unique)
 
 
 def call_ollama(
@@ -483,6 +555,7 @@ def call_ollama(
     num_predict: int,
     timeout_sec: int,
     images_base64: list[tuple[str, str]] | None = None,
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
 ) -> dict:
     url = normalize_chat_completions_url(api_url)
     payload = {
@@ -491,6 +564,7 @@ def call_ollama(
         "max_tokens": num_predict,
         "temperature": 0.6,
         "repetition_penalty": repetition_penalty,
+        "reasoning_effort": reasoning_effort,
     }
     if enable_thinking is not None:
         payload["extra_body"] = {
@@ -605,10 +679,12 @@ def call_until_valid_json(
     settings: Settings,
     prompt: str,
     images_base64: list[tuple[str, str]] | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[dict, dict | list | None, str | None]:
     last_response: dict = {}
     last_raw_invalid_response = ""
     retries = min(settings.max_json_retries, 3)
+    effort = reasoning_effort or settings.reasoning_effort
     for _ in range(retries):
         last_response = call_ollama(
             api_url=settings.api_url,
@@ -620,6 +696,7 @@ def call_until_valid_json(
             num_predict=settings.num_predict,
             timeout_sec=settings.request_timeout_sec,
             images_base64=images_base64,
+            reasoning_effort=effort,
         )
         raw_text = extract_chat_content(last_response)
         thinking_text, answer_text = split_thinking_and_answer(raw_text)
@@ -660,10 +737,12 @@ def save_prompt_result_json(
     ollama_response: dict,
     parsed_json: dict | list | None,
     format_error_raw_response: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> PromptRunResult:
     intermediate_dir.mkdir(parents=True, exist_ok=True)
     output_json = intermediate_dir / f"{prompt_file.stem}.json"
     raw_response_text = extract_chat_content(ollama_response)
+    reasoning_text = extract_reasoning_text(ollama_response)
     has_format_error = format_error_raw_response is not None and parsed_json is None
     payload = {
         "meta": {
@@ -676,10 +755,12 @@ def save_prompt_result_json(
             "documents": docs.all_documents,
             "unreadable_documents": list(docs.unreadable_documents),
             "format_error": has_format_error,
+            "reasoning_effort": reasoning_effort,
         },
         "данные": ensure_dict_payload(parsed_json).get("данные", []),
         "parsed_json_response": parsed_json,
         "raw_response_text": raw_response_text,
+        "reasoning_text": reasoning_text,
     }
     output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -974,6 +1055,9 @@ def process_subject_folder(
         if progress_callback is not None:
             progress_callback(index + 1, total_steps)
         prompt_text = read_text_file(prompt_file)
+        reasoning_effort, prompt_text = extract_prompt_reasoning_effort(
+            prompt_text, settings.reasoning_effort
+        )
         is_last = index == len(prompt_files) - 1
         if is_last:
             full_prompt = build_prompt_with_previous_steps(subject_name, prompt_text, prompt_runs)
@@ -987,7 +1071,12 @@ def process_subject_folder(
             )
             images = prepared.images_base64
 
-        response, parsed_json, format_error_raw_response = call_until_valid_json(settings, full_prompt, images)
+        response, parsed_json, format_error_raw_response = call_until_valid_json(
+            settings,
+            full_prompt,
+            images,
+            reasoning_effort=reasoning_effort,
+        )
         prompt_runs.append(
             save_prompt_result_json(
                 intermediate_dir=intermediate_dir,
@@ -997,6 +1086,7 @@ def process_subject_folder(
                 ollama_response=response,
                 parsed_json=parsed_json,
                 format_error_raw_response=format_error_raw_response,
+                reasoning_effort=reasoning_effort,
             )
         )
 

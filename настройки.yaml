@@ -1,7 +1,8 @@
-﻿api_url: http://111.88.125.234:8000/v1/chat/completions
+﻿api_url: http://111.88.115.161:8000/v1/chat/completions
 api_key: vllm_Q7xN2mP8Kc4Rv9YaFh3UzL6BtSDsE5Jn
-model: Qwen/Qwen3.6-27B-FP8
+model: Qwen/Qwen3.8-27B-FP8
 request_timeout_sec: 1200
 max_tokens: 16384
-enable_thinking: false
+enable_thinking: true
 repetition_penalty: 1.2
+reasoning_effort: xhigh

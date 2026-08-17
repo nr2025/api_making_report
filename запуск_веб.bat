@@ -18,5 +18,11 @@ if not exist "%~dp0.venv\Scripts\python.exe" (
     exit /b 1
 )
 
-"%~dp0.venv\Scripts\python.exe" -m streamlit run веб.py --server.address 0.0.0.0 --server.port 8501
+if not exist "%~dp0run_web.py" (
+    echo Не найден run_web.py в папке проекта.
+    pause
+    exit /b 1
+)
+
+"%~dp0.venv\Scripts\python.exe" "%~dp0run_web.py"
 pause
