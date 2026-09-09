@@ -417,13 +417,21 @@ def list_prompt_files(prompts_dir: Path) -> list[Path]:
 
 
 def subject_prefix(subject_name: str) -> str:
+    report_date = datetime.now().strftime("%d.%m.%Y")
     return (
         f"Субъект исследования: {subject_name}.\n"
+        f"Сегодняшняя дата: {report_date}.\n"
         "Если в задании не указано иное, данные извлекаются в отношении Субъекта.\n"
-        "Рассуждай и отвечай только на русском языке. "
-        'Ключ в JSON — строго "данные" русскими буквами.'
+        "Отвечай только на русском языке. "
+        "Отвечай только на русском языке. "
+        'Ключ в JSON — строго "данные" русскими буквами.\n'
+        "Указывай только то, что прямо прочитано в документах. "
+        "Не восстанавливай и не додумывай имена, даты, адреса и организации. "
+        "Нечитаемое пропускай. "
+        "Пустой ответ — правильный ответ, если данных нет: одна выдуманная строка хуже отсутствия ответа."
     )
 
+    
 
 def build_prompt_with_documents(
     subject_name: str,
@@ -662,6 +670,72 @@ def try_parse_valid_payload(text: str) -> dict | None:
     return normalize_payload_with_data_array(parsed)
 
 
+def _payload_from_candidate_text(candidate: str) -> dict | None:
+    parsed = extract_json_from_text(candidate)
+    if not isinstance(parsed, dict):
+        return None
+    return normalize_payload_with_data_array(parsed)
+
+
+def strip_inner_json_quotes(text: str) -> str:
+    """Убрать прямые кавычки внутри значений, оставив структурные кавычки JSON."""
+    result: list[str] = []
+    in_string = False
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if not in_string:
+            result.append(char)
+            if char == '"':
+                in_string = True
+            index += 1
+            continue
+        if char == "\\" and index + 1 < length:
+            result.append(char)
+            result.append(text[index + 1])
+            index += 2
+            continue
+        if char == '"':
+            look = index + 1
+            while look < length and text[look] in " \t\r\n":
+                look += 1
+            if look >= length or text[look] in ",}]:":
+                result.append(char)
+                in_string = False
+            index += 1
+            continue
+        result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def try_parse_valid_payload_with_repair(text: str) -> tuple[dict | None, str | None]:
+    """Обычный разбор, затем починка экранирования, затем удаление внутренних кавычек."""
+    payload = try_parse_valid_payload(text)
+    if payload is not None:
+        return payload, "прямой разбор"
+
+    if not text or not text.strip():
+        return None, None
+    candidate = strip_markdown_fences(text)
+    parsed = extract_json_from_text(candidate)
+    if isinstance(parsed, dict):
+        # Синтаксис JSON уже валиден, не хватает ключа «данные» — починка кавычек не поможет.
+        return None, None
+
+    escaped = candidate.replace('\\"', "»")
+    payload = _payload_from_candidate_text(escaped)
+    if payload is not None:
+        return payload, "починка экранирования"
+
+    unquoted = strip_inner_json_quotes(candidate)
+    payload = _payload_from_candidate_text(unquoted)
+    if payload is not None:
+        return payload, "удаление кавычек"
+    return None, None
+
+
 def has_consecutive_repeated_substring(
     text: str,
     max_allowed_repeats: int = 30,
@@ -680,12 +754,12 @@ def call_until_valid_json(
     prompt: str,
     images_base64: list[tuple[str, str]] | None = None,
     reasoning_effort: str | None = None,
-) -> tuple[dict, dict | list | None, str | None]:
+) -> tuple[dict, dict | list | None, str | None, str | None]:
     last_response: dict = {}
     last_raw_invalid_response = ""
     retries = min(settings.max_json_retries, 3)
     effort = reasoning_effort or settings.reasoning_effort
-    for _ in range(retries):
+    for attempt in range(retries):
         last_response = call_ollama(
             api_url=settings.api_url,
             api_key=settings.api_key,
@@ -701,24 +775,27 @@ def call_until_valid_json(
         raw_text = extract_chat_content(last_response)
         thinking_text, answer_text = split_thinking_and_answer(raw_text)
 
-        # Шаги 1–4 по ответу после </think> (или по всему тексту, если тега нет).
-        payload = try_parse_valid_payload(answer_text)
+        payload, repair_method = try_parse_valid_payload_with_repair(answer_text)
         if payload is not None:
-            return last_response, payload, None
+            if attempt > 0:
+                repair_method = "перезапрос"
+            return last_response, payload, None, repair_method
 
-        # Шаг 6: спасение из рассуждений (те же шаги 2–4), до перезапроса.
-        # Детектор повторов к рассуждениям не применяется.
-        salvaged = try_parse_valid_payload(thinking_text)
+        salvaged, salvage_method = try_parse_valid_payload_with_repair(thinking_text)
         if salvaged is not None:
-            return last_response, salvaged, None
+            if attempt > 0:
+                salvage_method = "перезапрос"
+            return last_response, salvaged, None, salvage_method
 
-        # Шаг 5: дегенерация только по остатку после обрезки и только если JSON не принят.
-        # Считаем исключительно подряд идущие повторы; к рассуждениям не применяем.
-        # Затем перезапрос (и при дегенерации, и при обычной ошибке формата).
         last_raw_invalid_response = raw_text
         has_consecutive_repeated_substring(answer_text)
         continue
-    return last_response, None, last_raw_invalid_response or extract_chat_content(last_response)
+    return (
+        last_response,
+        None,
+        last_raw_invalid_response or extract_chat_content(last_response),
+        None,
+    )
 
 
 def ensure_dict_payload(value: dict | list | None) -> dict:
@@ -738,6 +815,7 @@ def save_prompt_result_json(
     parsed_json: dict | list | None,
     format_error_raw_response: str | None = None,
     reasoning_effort: str | None = None,
+    json_repair: str | None = None,
 ) -> PromptRunResult:
     intermediate_dir.mkdir(parents=True, exist_ok=True)
     output_json = intermediate_dir / f"{prompt_file.stem}.json"
@@ -756,6 +834,7 @@ def save_prompt_result_json(
             "unreadable_documents": list(docs.unreadable_documents),
             "format_error": has_format_error,
             "reasoning_effort": reasoning_effort,
+            "json_repair": json_repair,
         },
         "данные": ensure_dict_payload(parsed_json).get("данные", []),
         "parsed_json_response": parsed_json,
@@ -916,6 +995,38 @@ def replace_placeholder_in_paragraphs(document, placeholder: str, lines: list[st
     return changed
 
 
+def replace_placeholder_in_story(story, placeholder: str, lines: list[str]) -> bool:
+    """Заменить плейсхолдер в paragraphs/tables контейнера python-docx."""
+    changed = False
+    for paragraph in story.paragraphs:
+        if replace_placeholder_with_lines(paragraph, placeholder, lines):
+            changed = True
+    for table in story.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    if replace_placeholder_with_lines(paragraph, placeholder, lines):
+                        changed = True
+    return changed
+
+
+def replace_report_date_placeholders(document) -> None:
+    report_date = datetime.now().strftime("%d.%m.%Y")
+    placeholder = "{{дата_отчёта}}"
+    replace_placeholder_in_story(document, placeholder, [report_date])
+    for section in document.sections:
+        replace_placeholder_in_story(section.header, placeholder, [report_date])
+        replace_placeholder_in_story(section.footer, placeholder, [report_date])
+
+
+def replace_subject_name_placeholders(document, subject_name: str) -> None:
+    placeholder = "{{ФИО_субъекта}}"
+    replace_placeholder_in_story(document, placeholder, [subject_name])
+    for section in document.sections:
+        replace_placeholder_in_story(section.header, placeholder, [subject_name])
+        replace_placeholder_in_story(section.footer, placeholder, [subject_name])
+
+
 def replace_text_in_paragraph(paragraph, old: str, new: str) -> None:
     if old not in paragraph.text:
         return
@@ -967,6 +1078,7 @@ def build_word_report(
     template_path: Path,
     output_docx: Path,
     prompt_results: list[PromptRunResult],
+    subject_name: str,
     unreadable_documents: list[str] | None = None,
 ) -> Path:
     if docx is None:
@@ -976,6 +1088,8 @@ def build_word_report(
 
     document = docx.Document(str(template_path))
     insert_unreadable_warning(document, unreadable_documents or [])
+    replace_report_date_placeholders(document)
+    replace_subject_name_placeholders(document, subject_name)
     payload_by_tag: dict[str, dict] = {}
     for step in prompt_results:
         try:
@@ -1071,7 +1185,7 @@ def process_subject_folder(
             )
             images = prepared.images_base64
 
-        response, parsed_json, format_error_raw_response = call_until_valid_json(
+        response, parsed_json, format_error_raw_response, json_repair = call_until_valid_json(
             settings,
             full_prompt,
             images,
@@ -1087,6 +1201,7 @@ def process_subject_folder(
                 parsed_json=parsed_json,
                 format_error_raw_response=format_error_raw_response,
                 reasoning_effort=reasoning_effort,
+                json_repair=json_repair,
             )
         )
 
@@ -1095,6 +1210,7 @@ def process_subject_folder(
         settings.template_path,
         report_docx_path,
         prompt_runs,
+        subject_name,
         unreadable_documents=prepared.unreadable_documents,
     )
     return intermediate_dir, report_docx_path, list(prepared.unreadable_documents)
